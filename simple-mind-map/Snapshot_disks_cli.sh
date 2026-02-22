@@ -639,7 +639,7 @@ fi
 TIMESTAMP_SUFFIX="$(date -u +%Y%m%d%H%M%S)"
 
 # ---------------------------------------------------------------------------
-# Create snapshots
+# Create snapshots (parallel execution)
 # ---------------------------------------------------------------------------
 CREATED_SNAPSHOT_NAMES=()
 CREATED_SNAPSHOT_IDS=()
@@ -649,6 +649,12 @@ CREATED_DISK_SKUS=()
 CREATED_DISK_SIZES=()
 PENDING_BG_SNAPSHOTS=()    # for --copy-start: names that need polling
 
+# Temp directory for capturing parallel snapshot output
+SNAP_TEMP_DIR=$(mktemp -d)
+declare -a SNAP_PIDS=()
+SNAP_IDX=0
+
+# --- Phase 1: Resolve disk info and launch snapshot creation in parallel ---
 for entry in "${SELECTED_ENTRIES[@]}"; do
   IFS='|' read -r DISK_NAME DISK_ID DISK_SKU <<< "$entry"
   SNAPSHOT_NAME="${SNAPSHOT_PREFIX}-${DISK_NAME}-${TIMESTAMP_SUFFIX}"
@@ -668,6 +674,13 @@ for entry in "${SELECTED_ENTRIES[@]}"; do
   log "  Incremental: $INCREMENTAL"
   [[ -n "$IA_DURATION" ]] && log "  IA duration: ${IA_DURATION} minutes"
 
+  # Store disk info (indexed for result collection later)
+  CREATED_SNAPSHOT_NAMES+=("$SNAPSHOT_NAME")
+  CREATED_DISK_NAMES+=("$DISK_NAME")
+  CREATED_DISK_IDS+=("$DISK_ID")
+  CREATED_DISK_SKUS+=("$DISK_SKU")
+  CREATED_DISK_SIZES+=("$DISK_SIZE_GB")
+
   # Build az snapshot create command
   SNAP_ARGS=(snapshot create
     --subscription "$SUBSCRIPTION_ID"
@@ -686,70 +699,103 @@ for entry in "${SELECTED_ENTRIES[@]}"; do
 
   if [[ "$DRY_RUN" == "true" ]]; then
     log "[DRY-RUN] az ${SNAP_ARGS[*]}"
-    SNAP_ID="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${TARGET_RG}/providers/Microsoft.Compute/snapshots/${SNAPSHOT_NAME}"
+    printf '%s' "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${TARGET_RG}/providers/Microsoft.Compute/snapshots/${SNAPSHOT_NAME}" \
+      > "$SNAP_TEMP_DIR/${SNAP_IDX}.id"
+    printf '0' > "$SNAP_TEMP_DIR/${SNAP_IDX}.exit"
   else
+    # Launch snapshot creation in a background subshell
+    CUR_IDX=$SNAP_IDX
+    (
+      snap_out=$(az_with_retry az "${SNAP_ARGS[@]}" --query "id" -o tsv 2>&1)
+      snap_rc=$?
+      printf '%s' "$snap_out" > "$SNAP_TEMP_DIR/${CUR_IDX}.id"
+      printf '%s' "$snap_rc" > "$SNAP_TEMP_DIR/${CUR_IDX}.exit"
+    ) &
+    SNAP_PIDS+=($!)
+    log "  Launched in background (PID $!)"
+  fi
+
+  SNAP_IDX=$((SNAP_IDX + 1))
+done
+
+# --- Phase 2: Wait for all parallel snapshot creations to complete ---
+if [[ "$DRY_RUN" != "true" && ${#SNAP_PIDS[@]} -gt 0 ]]; then
+  log ""
+  log "Waiting for ${#SNAP_PIDS[@]} parallel snapshot creation(s) to complete..."
+  for pid in "${SNAP_PIDS[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+  log "All snapshot creations have returned."
+fi
+
+# --- Phase 3: Collect results, verify IA duration, track for polling ---
+SNAP_FAILURES=0
+for i in "${!CREATED_SNAPSHOT_NAMES[@]}"; do
+  SNAPSHOT_NAME="${CREATED_SNAPSHOT_NAMES[$i]}"
+
+  snap_exit=$(cat "$SNAP_TEMP_DIR/${i}.exit" 2>/dev/null) || snap_exit="1"
+  snap_output=$(cat "$SNAP_TEMP_DIR/${i}.id" 2>/dev/null) || snap_output=""
+
+  if [[ "$snap_exit" != "0" ]]; then
+    log_error "Failed to create snapshot $SNAPSHOT_NAME:"
+    log_error "$snap_output"
+    CREATED_SNAPSHOT_IDS+=("")
+    SNAP_FAILURES=$((SNAP_FAILURES + 1))
+    continue
+  fi
+
+  SNAP_ID="$snap_output"
+  CREATED_SNAPSHOT_IDS+=("$SNAP_ID")
+  log "  Snapshot ready: $SNAPSHOT_NAME"
+  debug "    $SNAP_ID"
+
+  # Verify instant access duration was set if requested
+  if [[ -n "$IA_DURATION" && "$DRY_RUN" != "true" ]]; then
     set +e
-    SNAP_OUTPUT=$(az_with_retry az "${SNAP_ARGS[@]}" --query "id" -o tsv 2>&1)
-    SNAP_EXIT=$?
+    IA_OUTPUT=$(az_with_retry az snapshot show \
+      --subscription "$SUBSCRIPTION_ID" \
+      --resource-group "$TARGET_RG" \
+      --name "$SNAPSHOT_NAME" \
+      --query "creationData.instantAccessDurationMinutes" -o tsv 2>&1)
+    IA_EXIT=$?
     set -e
-
-    if [[ $SNAP_EXIT -ne 0 ]]; then
-      log_error "Failed to create snapshot $SNAPSHOT_NAME:"
-      log_error "$SNAP_OUTPUT"
-      exit $SNAP_EXIT
-    fi
-
-    SNAP_ID="$SNAP_OUTPUT"
-    log "  Snapshot created: $SNAP_ID"
-
-    # Verify instant access duration was set if requested
-    if [[ -n "$IA_DURATION" ]]; then
+    if [[ $IA_EXIT -ne 0 || -z "$IA_OUTPUT" || "$IA_OUTPUT" == "None" ]]; then
+      log "  WARNING: Could not verify instant access duration on $SNAPSHOT_NAME"
+      # Attempt to set it via snapshot update as fallback
+      log "  Attempting snapshot update to set instant access duration..."
+      debug "az snapshot update --subscription $SUBSCRIPTION_ID -g $TARGET_RG -n $SNAPSHOT_NAME --set creationData.instantAccessDurationMinutes=$IA_DURATION"
       set +e
-      IA_OUTPUT=$(az_with_retry az snapshot show \
+      IA_PATCH_OUTPUT=$(az_with_retry az snapshot update \
         --subscription "$SUBSCRIPTION_ID" \
         --resource-group "$TARGET_RG" \
         --name "$SNAPSHOT_NAME" \
+        --set "creationData.instantAccessDurationMinutes=$IA_DURATION" \
         --query "creationData.instantAccessDurationMinutes" -o tsv 2>&1)
-      IA_EXIT=$?
+      IA_PATCH_EXIT=$?
       set -e
-      if [[ $IA_EXIT -ne 0 || -z "$IA_OUTPUT" || "$IA_OUTPUT" == "None" ]]; then
-        log "  WARNING: Could not verify instant access duration on $SNAPSHOT_NAME"
-        # Attempt to set it via snapshot update as fallback
-        log "  Attempting snapshot update to set instant access duration..."
-        debug "az snapshot update --subscription $SUBSCRIPTION_ID -g $TARGET_RG -n $SNAPSHOT_NAME --set creationData.instantAccessDurationMinutes=$IA_DURATION"
-        set +e
-        IA_PATCH_OUTPUT=$(az_with_retry az snapshot update \
-          --subscription "$SUBSCRIPTION_ID" \
-          --resource-group "$TARGET_RG" \
-          --name "$SNAPSHOT_NAME" \
-          --set "creationData.instantAccessDurationMinutes=$IA_DURATION" \
-          --query "creationData.instantAccessDurationMinutes" -o tsv 2>&1)
-        IA_PATCH_EXIT=$?
-        set -e
-        if [[ $IA_PATCH_EXIT -ne 0 ]]; then
-          log_error "  WARNING: Failed to set instant access duration on $SNAPSHOT_NAME:"
-          log_error "  $IA_PATCH_OUTPUT"
-        else
-          log "  Instant access duration set: ${IA_PATCH_OUTPUT} minutes"
-        fi
+      if [[ $IA_PATCH_EXIT -ne 0 ]]; then
+        log_error "  WARNING: Failed to set instant access duration on $SNAPSHOT_NAME:"
+        log_error "  $IA_PATCH_OUTPUT"
       else
-        log "  Instant access duration set: ${IA_OUTPUT} minutes"
+        log "  Instant access duration set: ${IA_PATCH_OUTPUT} minutes"
       fi
-    fi
-
-    # Track background-copy snapshots for polling
-    if [[ "$COPY_START" == "true" ]]; then
-      PENDING_BG_SNAPSHOTS+=("$SNAPSHOT_NAME")
+    else
+      log "  Instant access duration set: ${IA_OUTPUT} minutes"
     fi
   fi
 
-  CREATED_SNAPSHOT_NAMES+=("$SNAPSHOT_NAME")
-  CREATED_SNAPSHOT_IDS+=("$SNAP_ID")
-  CREATED_DISK_NAMES+=("$DISK_NAME")
-  CREATED_DISK_IDS+=("$DISK_ID")
-  CREATED_DISK_SKUS+=("$DISK_SKU")
-  CREATED_DISK_SIZES+=("$DISK_SIZE_GB")
+  # Track background-copy snapshots for polling
+  if [[ "$COPY_START" == "true" && "$DRY_RUN" != "true" ]]; then
+    PENDING_BG_SNAPSHOTS+=("$SNAPSHOT_NAME")
+  fi
 done
+
+rm -rf "$SNAP_TEMP_DIR"
+
+if [[ $SNAP_FAILURES -gt 0 ]]; then
+  log_error "$SNAP_FAILURES of ${#CREATED_SNAPSHOT_NAMES[@]} snapshot creation(s) failed."
+  exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # Poll for background copy completion (--copy-start mode)

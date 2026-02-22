@@ -137,6 +137,13 @@ Snapshot options:
                                   tier before being moved to standard storage.
                                   Valid range: 1 – 10080 (7 days). No default.
 
+Network access:
+  --public-network-access <val>  Public network access setting for the snapshot.
+                                  Valid values: Enabled, Disabled (default: Disabled)
+  --network-access-policy <val>  Network access policy for the snapshot.
+                                  Valid values: AllowAll, AllowPrivate, DenyAll
+                                  (default: DenyAll)
+
 Disk selection:
   --only-disks <disk1,...>       Comma-separated list of data disk names to snapshot.
                                   If omitted, all data disks on the VM are included.
@@ -234,6 +241,8 @@ TIMEOUT_MINUTES=60
 POLL_SECONDS=15
 IA_DURATION=""
 ONLY_DISKS=""
+PUBLIC_NETWORK_ACCESS="Disabled"
+NETWORK_ACCESS_POLICY="DenyAll"
 LOG_FILE=""
 METADATA_FILE=""
 DEBUG=false
@@ -306,6 +315,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --only-disks)
       ONLY_DISKS="$2"
+      shift 2
+      ;;
+    --public-network-access)
+      PUBLIC_NETWORK_ACCESS="$2"
+      shift 2
+      ;;
+    --network-access-policy)
+      NETWORK_ACCESS_POLICY="$2"
       shift 2
       ;;
     --log-file)
@@ -688,7 +705,9 @@ for entry in "${SELECTED_ENTRIES[@]}"; do
     --name "$SNAPSHOT_NAME"
     --location "$VM_LOCATION"
     --source "$DISK_ID"
-    --incremental "$INCREMENTAL")
+    --incremental "$INCREMENTAL"
+    --public-network-access "$PUBLIC_NETWORK_ACCESS"
+    --network-access-policy "$NETWORK_ACCESS_POLICY")
 
   if [[ "$COPY_START" == "true" ]]; then
     SNAP_ARGS+=(--copy-start true)

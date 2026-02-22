@@ -709,6 +709,10 @@ for entry in "${SELECTED_ENTRIES[@]}"; do
     --public-network-access "$PUBLIC_NETWORK_ACCESS"
     --network-access-policy "$NETWORK_ACCESS_POLICY")
 
+  if [[ -n "$IA_DURATION" ]]; then
+    SNAP_ARGS+=(--instant-access-duration-minutes "$IA_DURATION")
+  fi
+
   if [[ "$COPY_START" == "true" ]]; then
     SNAP_ARGS+=(--copy-start true)
     debug "  Background copy mode (CopyStart)"
